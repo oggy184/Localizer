@@ -221,3 +221,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Localizer ---
+# komponen hasil unduhan (ratusan MB)
+bin/
+
+# proyek pengguna
+www/
+
+# dibuat otomatis saat program dijalankan
+config.json
