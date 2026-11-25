@@ -115,6 +115,10 @@ Teks tetap tajam di layar berskala 125%/150%.
   - **MariaDB**: folder data diinisialisasi saat pertama kali (user `root`, password kosong)
   - **Nginx**: situs ditulis ke `conf/localizer-sites.conf`, PHP-CGI dinyalakan otomatis
 - **Vhost default**: `http://localhost` menampilkan isi folder `www`
+- **Pengaturan per situs** (Situs → pilih situs → **Pengaturan situs…**): domain tambahan
+  (mis. `api.blog.test`), folder root kustom (mis. `web`, `dist`), dan blok konfigurasi Apache/Nginx
+  tambahan. Disimpan di `config.json` (kunci `sites`) sehingga tidak tertimpa saat sinkron. Setelah
+  disimpan, konfigurasi diuji (`httpd -t` / `nginx -t`); bila ditolak, pengaturan dikembalikan otomatis
 - Virtual host otomatis: folder `www/blog` menjadi `http://blog.test`
   (memakai folder `public/` jika ada; nama folder disesuaikan agar jadi domain valid)
 - **phpMyAdmin**: `http://localhost/phpmyadmin`, `config.inc.php` dibuat otomatis

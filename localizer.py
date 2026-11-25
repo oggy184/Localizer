@@ -21,7 +21,8 @@ import urllib.request
 import webbrowser
 import zipfile
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, simpledialog, ttk
+from collections import namedtuple
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from urllib.parse import urljoin
 
 # Folder program: tempat exe (PyInstaller) atau tempat skrip ini
@@ -132,6 +133,26 @@ def with_block(text, body):
 
 def to_hostname(name):
     return re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
+
+
+def valid_hostname(host):
+    """Nama domain lengkap yang sah, mis. api.blog.test (minimal dua bagian)."""
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    return len(host) <= 253 and re.fullmatch(rf"{label}(?:\.{label})+", host) is not None
+
+
+# Satu situs: nama folder, domain utama, document root, folder situs, domain tambahan, blok tambahan
+Site = namedtuple("Site", "name host root folder aliases apache_extra nginx_extra")
+
+
+def site_root(folder, root_cfg):
+    """Document root situs. root_cfg kosong = otomatis (public/ bila ada, selain itu folder situs);
+    relatif terhadap folder situs atau path absolut. None bila root_cfg diisi tapi tidak ada."""
+    if root_cfg:
+        path = root_cfg if os.path.isabs(root_cfg) else os.path.join(folder, root_cfg)
+        return os.path.normpath(path) if os.path.isdir(path) else None
+    public = os.path.join(folder, "public")
+    return public if os.path.isdir(public) else folder
 
 
 def tool_env(extra=None):
@@ -1178,7 +1199,8 @@ class App(tk.Tk):
 
     # --- Situs ---
     def _page_sites(self, page):
-        self._header(page, "Situs", f"Setiap folder di www otomatis menjadi domain lokal.",
+        self._header(page, "Situs", "Setiap folder di www otomatis menjadi domain lokal. "
+                                    "Klik dua kali untuk membuka situs.",
                      [("Folder www", self.open_www, False), ("Sinkronkan", self.sync_vhosts, False),
                       ("+ Situs Baru", self.new_project, True)])
         box = self._card(page, fill="both", expand=True)
@@ -1201,22 +1223,22 @@ class App(tk.Tk):
         bar = tk.Frame(page, bg=C_BG)
         bar.pack(fill="x", pady=(12, 0))
         self.site_buttons = []
-        actions = [("Buka di browser", "browser"), ("Buka folder", "folder"), ("Terminal", "terminal")]
+        actions = [("Buka di browser", "browser"), ("Pengaturan situs…", "settings"),
+                   ("Buka folder", "folder"), ("Terminal", "terminal")]
         if shutil.which("code"):
             actions.append(("Buka di VS Code", "code"))
         for text, act in actions:
             b = ttk.Button(bar, text=text, command=lambda a=act: self.site_action(a), state="disabled")
             b.pack(side="left", padx=(0, 8))
             self.site_buttons.append(b)
-        tk.Label(bar, text="Klik dua kali untuk membuka situs", font=F_SMALL, bg=C_BG,
-                 fg=C_MUTED).pack(side="right")
 
     def refresh_sites(self):
         self.site_rows = []
         tree = self.sites_tree
         tree.delete(*tree.get_children())
-        for host, root in self.collect_sites():
-            folder = root[:-len("/public")] if root.endswith("/public") else root
+        custom = CFG.get("sites", {})
+        for site in self.collect_sites():
+            folder = site.folder
             if os.path.isfile(os.path.join(folder, "artisan")):
                 kind = "Laravel"
             elif os.path.isfile(os.path.join(folder, "wp-config.php")) or \
@@ -1224,9 +1246,11 @@ class App(tk.Tk):
                 kind = "WordPress"
             else:
                 kind = "PHP"
-            self.site_rows.append((host, folder))
-            tree.insert("", "end", iid=host, text="  " + host.rsplit(".", 1)[0],
-                        values=(self.site_url(host), kind, os.path.relpath(folder, BASE)))
+            self.site_rows.append(site)
+            url = self.site_url(site.host) + (f"   +{len(site.aliases)} domain" if site.aliases else "")
+            name = "  " + site.host.rsplit(".", 1)[0] + ("   ⚙" if custom.get(site.name) else "")
+            tree.insert("", "end", iid=site.host, text=name,
+                        values=(url, kind, os.path.relpath(folder, BASE)))
         if self.site_rows:
             self.sites_empty.place_forget()
         else:
@@ -1249,10 +1273,13 @@ class App(tk.Tk):
         if not sel:
             return
         host = sel[0]
-        folder = next((f for h, f in self.site_rows if h == host), None)
-        if not folder:
+        site = next((s for s in self.site_rows if s.host == host), None)
+        if not site:
             return
-        if action == "browser":
+        folder = site.folder
+        if action == "settings":
+            self.open_site_settings(site)
+        elif action == "browser":
             if not self.web_url():
                 self.log("Apache/Nginx belum berjalan — nyalakan dulu di halaman Layanan.")
                 self.show_page("services")
@@ -1264,6 +1291,155 @@ class App(tk.Tk):
             self.open_terminal(folder)
         elif action == "code":
             subprocess.Popen(["code", os.path.normpath(folder)], shell=IS_WIN, creationflags=NO_WINDOW)
+
+    # --- Pengaturan per situs ---
+    def open_site_settings(self, site):
+        if getattr(self, "_site_saving", False):
+            messagebox.showinfo("Pengaturan situs", "Pengaturan sebelumnya masih diterapkan, tunggu sebentar.")
+            return
+        sc = CFG.get("sites", {}).get(site.name, {})
+        tld = CFG.get("tld", "test")
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Pengaturan situs — {site.name}")
+        dlg.transient(self)
+        dlg.configure(bg=C_BG)
+        dlg.minsize(self.px(560), self.px(520))
+        frm = tk.Frame(dlg, bg=C_BG)
+        frm.pack(fill="both", expand=True, padx=24, pady=20)
+        frm.grid_columnconfigure(0, weight=1)
+
+        def label(row, text, help_text=""):
+            tk.Label(frm, text=text, font=F_BOLD, bg=C_BG, fg=C_TEXT, anchor="w").grid(
+                row=row, column=0, columnspan=2, sticky="ew", pady=(12, 2))
+            if help_text:
+                tk.Label(frm, text=help_text, font=F_SMALL, bg=C_BG, fg=C_MUTED, anchor="w", justify="left",
+                         wraplength=self.px(520)).grid(row=row + 1, column=0, columnspan=2, sticky="ew")
+
+        def textbox(row, value, height, mono=False):
+            box = tk.Frame(frm, bg=C_BG, highlightthickness=1, highlightbackground=C_BORDER,
+                           highlightcolor=C_ACCENT)
+            box.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+            t = tk.Text(box, height=height, font=("Consolas", 10) if mono else F_BODY, relief="flat",
+                        wrap="none" if mono else "word", padx=8, pady=6, bg="white", undo=True)
+            t.pack(fill="both", expand=True)
+            t.insert("1.0", value)
+            return t
+
+        tk.Label(frm, text=site.name, font=F_H2, bg=C_BG, fg=C_TEXT, anchor="w").grid(
+            row=0, column=0, columnspan=2, sticky="ew")
+        tk.Label(frm, text=f"Domain utama: {site.host}   ·   Folder: {os.path.relpath(site.folder, BASE)}",
+                 font=F_SMALL, bg=C_BG, fg=C_MUTED, anchor="w").grid(row=1, column=0, columnspan=2, sticky="ew")
+
+        label(2, "Domain tambahan",
+              f"Satu domain per baris. Tanpa titik otomatis ditambah .{tld} (mis. api → api.{tld}). "
+              f"Contoh: api.{site.host}")
+        aliases_txt = textbox(4, "\n".join(sc.get("aliases", [])), 3)
+
+        label(5, "Folder root (document root)",
+              "Kosongkan / (otomatis) = folder public bila ada, selain itu folder situs. "
+              "Bisa relatif terhadap folder situs (mis. web, dist) atau path lengkap.")
+        root_var = tk.StringVar(value=sc.get("root", "") or "(otomatis)")
+        subdirs = sorted(d for d in os.listdir(site.folder)
+                         if os.path.isdir(os.path.join(site.folder, d)) and not d.startswith("."))
+        root_row = tk.Frame(frm, bg=C_BG)
+        root_row.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Combobox(root_row, textvariable=root_var, values=["(otomatis)", *subdirs]).pack(
+            side="left", fill="x", expand=True)
+
+        def browse():
+            path = filedialog.askdirectory(parent=dlg, initialdir=site.folder, title="Pilih folder root")
+            if path:
+                rel = os.path.relpath(path, site.folder)
+                root_var.set(fwd(rel) if not rel.startswith("..") else fwd(path))
+        ttk.Button(root_row, text="Pilih…", style="Small.TButton", command=browse).pack(side="left", padx=(8, 0))
+
+        label(8, "Konfigurasi Apache tambahan",
+              "Disisipkan di dalam <VirtualHost> situs ini. Contoh: Header set X-Frame-Options \"DENY\"")
+        apache_txt = textbox(10, sc.get("apache", ""), 5, mono=True)
+        label(11, "Konfigurasi Nginx tambahan", "Disisipkan di dalam blok server { } situs ini (bila memakai Nginx).")
+        nginx_txt = textbox(13, sc.get("nginx", ""), 3, mono=True)
+        frm.grid_rowconfigure(10, weight=1)
+
+        def reset():
+            for t in (aliases_txt, apache_txt, nginx_txt):
+                t.delete("1.0", "end")
+            root_var.set("(otomatis)")
+
+        def save():
+            # domain tambahan
+            aliases = []
+            others = {h for s in self.site_rows if s.name != site.name for h in (s.host, *s.aliases)}
+            for raw in re.split(r"[\s,;]+", aliases_txt.get("1.0", "end")):
+                a = raw.strip().lower().rstrip(".")
+                if not a:
+                    continue
+                if "." not in a:
+                    a = f"{a}.{tld}"
+                if not valid_hostname(a):
+                    messagebox.showerror("Domain tidak valid", f"'{raw}' bukan nama domain yang sah.", parent=dlg)
+                    return
+                if a in others:
+                    owner = next(s.name for s in self.site_rows if a in (s.host, *s.aliases))
+                    messagebox.showerror("Domain sudah dipakai", f"{a} sudah dipakai situs '{owner}'.", parent=dlg)
+                    return
+                if a != site.host and a not in aliases:
+                    aliases.append(a)
+            # folder root
+            root = root_var.get().strip()
+            root = "" if root in ("", "(otomatis)") else root
+            if root and site_root(site.folder, root) is None:
+                messagebox.showerror("Folder tidak ditemukan", f"Folder root '{root}' tidak ada.", parent=dlg)
+                return
+            new = {k: v for k, v in (("aliases", aliases), ("root", root),
+                                     ("apache", apache_txt.get("1.0", "end").strip()),
+                                     ("nginx", nginx_txt.get("1.0", "end").strip())) if v}
+            old = json.loads(json.dumps(CFG.get("sites", {}).get(site.name)))
+            self._store_site_settings(site.name, new)
+            dlg.destroy()
+            self._site_saving = True
+            self._dl_show(f"Menerapkan pengaturan situs {site.name}…", "Menulis vhost dan menguji konfigurasi",
+                          icon=ICONS["settings"])
+            threading.Thread(target=self._apply_site_settings, args=(site.name, old), daemon=True).start()
+
+        btns = tk.Frame(frm, bg=C_BG)
+        btns.grid(row=14, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        ttk.Button(btns, text="Kosongkan semua", command=reset).pack(side="left")
+        ttk.Button(btns, text="Simpan", style="Accent.TButton", command=save).pack(side="right")
+        ttk.Button(btns, text="Batal", command=dlg.destroy).pack(side="right", padx=(0, 8))
+        dlg.grab_set()
+
+    @staticmethod
+    def _store_site_settings(name, settings):
+        sites = CFG.setdefault("sites", {})
+        if settings:
+            sites[name] = settings
+        else:
+            sites.pop(name, None)
+        save_config(CFG)
+
+    def _apply_site_settings(self, name, old):
+        """Tulis vhost, uji konfigurasi; bila ditolak, kembalikan pengaturan lama (thread terpisah)."""
+        try:
+            self.sync_vhosts(restart=False)
+            error = self.test_server_configs()
+            if error:
+                self._store_site_settings(name, old)
+                self.sync_vhosts(restart=False)
+                self.log(f"Pengaturan situs '{name}' ditolak server dan dikembalikan:\n{error}")
+                self.ui(lambda: self._dl_done(False, f"Pengaturan situs '{name}' tidak disimpan",
+                                              "Konfigurasi ditolak server; pengaturan dikembalikan. Lihat log."))
+                self.ui(lambda: messagebox.showerror(
+                    "Konfigurasi ditolak", f"{error[:1500]}\n\nPengaturan situs '{name}' dikembalikan ke sebelumnya."))
+            else:
+                self.restart_web_servers()
+                self.log(f"Pengaturan situs '{name}' disimpan.")
+                self.ui(lambda: self._dl_done(True, f"Pengaturan situs '{name}' disimpan",
+                                              "Vhost dan file hosts sudah diperbarui."))
+        except Exception as e:
+            self.log(f"Gagal menerapkan pengaturan situs '{name}': {e}")
+            self.ui(lambda: self._dl_done(False, f"Gagal menerapkan pengaturan situs '{name}'", str(e)))
+        finally:
+            self._site_saving = False
 
     # --- Layanan ---
     def _page_services(self, page):
@@ -1670,14 +1846,14 @@ class App(tk.Tk):
         self._dl_hide_job = None
         bar.grid_remove()
 
-    def _dl_show(self, title, detail="", value=None):
+    def _dl_show(self, title, detail="", value=None, icon=""):
         """Tampilkan panel progres; value None = animasi berjalan (lama belum diketahui)."""
         if self._dl_hide_job:
             self.after_cancel(self._dl_hide_job)
             self._dl_hide_job = None
         self.dl_banner.grid()
         self.dl_close.pack_forget()
-        self.dl_icon.configure(text="", fg=C_ACCENT)
+        self.dl_icon.configure(text=icon, fg=C_ACCENT)
         self.dl_title.configure(text=title, fg=C_TEXT)
         self.dl_detail.configure(text=detail)
         self.dl_bar.pack(fill="x", pady=(6, 0))
@@ -1939,10 +2115,23 @@ class App(tk.Tk):
         return True
 
     def prepare_nginx(self):
+        if not self.configure_nginx():
+            return True
+        cgi = self.svc("PHP-CGI")
+        if cgi and cgi.available:
+            if not cgi.running:
+                self.log("[Nginx] Menyalakan PHP-CGI untuk memproses PHP…")
+                cgi.start()
+        else:
+            self.log("[Nginx] PHP-CGI (php-cgi.exe) tidak tersedia; file .php tidak akan jalan.")
+        return True
+
+    def configure_nginx(self):
+        """Tulis situs dan pastikan nginx.conf memuatnya. False bila Nginx belum terpasang."""
         main = os.path.join(NGINX, "conf", "nginx.conf")
         if not os.path.isfile(main):
             self.log(f"[Nginx] {main} tidak ditemukan.")
-            return True
+            return False
         self.prepare_php()
         self.prepare_phpmyadmin()
         self.write_nginx_sites(self.collect_sites())
@@ -1962,14 +2151,6 @@ class App(tk.Tk):
         if text != orig:
             write_text(main, text)
             self.log("[Nginx] nginx.conf diperbarui.")
-
-        cgi = self.svc("PHP-CGI")
-        if cgi and cgi.available:
-            if not cgi.running:
-                self.log("[Nginx] Menyalakan PHP-CGI untuk memproses PHP…")
-                cgi.start()
-        else:
-            self.log("[Nginx] PHP-CGI (php-cgi.exe) tidak tersedia; file .php tidak akan jalan.")
         return True
 
     # ---------- menu cepat ----------
@@ -2081,9 +2262,11 @@ class App(tk.Tk):
 
     # ---------- virtual host ----------
     def collect_sites(self, verbose=False):
-        """[(domain, document_root)] dari subfolder www; nama folder dijadikan hostname valid."""
+        """Daftar Site dari subfolder www, digabung dengan pengaturan per situs di config.json
+        (CFG["sites"][nama_folder] = {"aliases": [...], "root": "...", "apache": "...", "nginx": "..."})."""
         tld = CFG.get("tld", "test")
-        sites, seen = [], set()
+        site_cfg = CFG.get("sites", {})
+        primaries, used = [], set()
         for d in sorted(os.listdir(WWW)):
             full = os.path.join(WWW, d)
             if not os.path.isdir(full) or d.startswith("."):
@@ -2093,32 +2276,56 @@ class App(tk.Tk):
                 if verbose:
                     self.log(f"Folder '{d}' dilewati: nama tidak bisa dijadikan domain.")
                 continue
-            if host in seen:
+            domain = f"{host}.{tld}"
+            if domain in used:
                 if verbose:
-                    self.log(f"Folder '{d}' dilewati: domain {host}.{tld} sudah dipakai folder lain.")
+                    self.log(f"Folder '{d}' dilewati: domain {domain} sudah dipakai folder lain.")
                 continue
             if verbose and host != d.lower():
-                self.log(f"Folder '{d}' → {host}.{tld} (nama disesuaikan agar jadi domain valid).")
-            seen.add(host)
-            public = os.path.join(full, "public")
-            root = public if os.path.isdir(public) else full
-            sites.append((f"{host}.{tld}", fwd(root)))
+                self.log(f"Folder '{d}' → {domain} (nama disesuaikan agar jadi domain valid).")
+            used.add(domain)
+            primaries.append((d, domain, full))
+
+        # domain tambahan diproses setelah semua domain utama, agar domain utama selalu menang
+        sites = []
+        for d, domain, full in primaries:
+            sc = site_cfg.get(d, {})
+            aliases = []
+            for a in sc.get("aliases", []):
+                if a in used:
+                    if verbose:
+                        self.log(f"Domain tambahan {a} untuk '{d}' dilewati: sudah dipakai situs lain.")
+                    continue
+                used.add(a)
+                aliases.append(a)
+            root = site_root(full, sc.get("root", ""))
+            if sc.get("root") and root is None:
+                if verbose:
+                    self.log(f"Folder root '{sc['root']}' untuk '{d}' tidak ditemukan; memakai bawaan.")
+            sites.append(Site(d, domain, fwd(root or site_root(full, "")), fwd(full), aliases,
+                              sc.get("apache", ""), sc.get("nginx", "")))
         return sites
 
     @staticmethod
-    def _apache_vhost(host, root, port, indexes=False):
+    def _apache_vhost(host, root, port, indexes=False, aliases=(), extra=""):
         opts = "Indexes FollowSymLinks" if indexes else "FollowSymLinks"
-        alias = "  ServerAlias 127.0.0.1\n" if host == "localhost" else ""
+        names = ["127.0.0.1"] if host == "localhost" else list(aliases)
+        alias = f"  ServerAlias {' '.join(names)}\n" if names else ""
+        extra_block = ""
+        if extra.strip():
+            extra_block = "  # Konfigurasi tambahan (Pengaturan situs)\n" + \
+                "".join(f"  {line}\n" for line in extra.strip().splitlines())
         return (f'<VirtualHost *:{port}>\n  ServerName {host}\n{alias}  DocumentRoot "{root}"\n'
                 f'  <Directory "{root}">\n    Options {opts}\n    AllowOverride All\n'
-                f'    Require all granted\n  </Directory>\n</VirtualHost>\n')
+                f'    Require all granted\n  </Directory>\n{extra_block}</VirtualHost>\n')
 
     def write_apache_vhosts(self, sites):
         """Tulis conf/extra/localizer-vhosts.conf; kembalikan path-nya (None jika Apache belum ada)."""
         if not os.path.isdir(os.path.join(APACHE, "conf")):
             return None
         port = self.port_of("Apache", 80)
-        parts = ["# Dibuat otomatis oleh Localizer - perubahan manual akan ditimpa.\n"]
+        parts = ["# Dibuat otomatis oleh Localizer - perubahan manual akan ditimpa.\n"
+                 "# Ubah lewat halaman Situs -> Pengaturan situs.\n"]
         if pma_ready():
             pma = fwd(PMA)
             parts.append(f'Alias /phpmyadmin "{pma}"\n<Directory "{pma}">\n  Options FollowSymLinks\n'
@@ -2126,7 +2333,8 @@ class App(tk.Tk):
                          f'</Directory>\n')
         # vhost pertama = default: http://localhost menampilkan folder www
         parts.append(self._apache_vhost("localhost", fwd(WWW), port, indexes=True))
-        parts += [self._apache_vhost(h, r, port) for h, r in sites]
+        parts += [self._apache_vhost(s.host, s.root, port, aliases=s.aliases, extra=s.apache_extra)
+                  for s in sites]
         conf_dir = os.path.join(APACHE, "conf", "extra")
         os.makedirs(conf_dir, exist_ok=True)
         path = os.path.join(conf_dir, "localizer-vhosts.conf")
@@ -2134,10 +2342,10 @@ class App(tk.Tk):
         return path
 
     @staticmethod
-    def _nginx_server(host, root, port, fcgi, default=False):
+    def _nginx_server(host, root, port, fcgi, default=False, aliases=(), extra=""):
         lines = ["server {",
                  f"    listen {port}{' default_server' if default else ''};",
-                 f"    server_name {host};",
+                 f"    server_name {' '.join([host, *aliases])};",
                  f'    root "{root}";',
                  "    index index.php index.html;",
                  "    client_max_body_size 128m;"]
@@ -2162,8 +2370,11 @@ class App(tk.Tk):
                   "        fastcgi_index index.php;",
                   "        include fastcgi_params;",
                   "        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;",
-                  "    }",
-                  "}", ""]
+                  "    }"]
+        if extra.strip():
+            lines.append("    # Konfigurasi tambahan (Pengaturan situs)")
+            lines += [f"    {line}" for line in extra.strip().splitlines()]
+        lines += ["}", ""]
         return "\n".join(lines)
 
     def write_nginx_sites(self, sites):
@@ -2172,14 +2383,16 @@ class App(tk.Tk):
             return None
         port = self.port_of("Nginx", 8080)
         fcgi = f"127.0.0.1:{self.port_of('PHP-CGI', 9000)}"
-        parts = ["# Dibuat otomatis oleh Localizer - perubahan manual akan ditimpa.\n",
+        parts = ["# Dibuat otomatis oleh Localizer - perubahan manual akan ditimpa.\n"
+                 "# Ubah lewat halaman Situs -> Pengaturan situs.\n",
                  self._nginx_server("localhost", fwd(WWW), port, fcgi, default=True)]
-        parts += [self._nginx_server(h, r, port, fcgi) for h, r in sites]
+        parts += [self._nginx_server(s.host, s.root, port, fcgi, aliases=s.aliases, extra=s.nginx_extra)
+                  for s in sites]
         path = os.path.join(conf_dir, "localizer-sites.conf")
         write_text(path, "\n".join(parts))
         return path
 
-    def sync_vhosts(self):
+    def sync_vhosts(self, restart=True):
         sites = self.collect_sites(verbose=True)
         if self.write_apache_vhosts(sites):
             self.log(f"Virtual host Apache ditulis ({len(sites)} situs + localhost).")
@@ -2187,13 +2400,37 @@ class App(tk.Tk):
             self.log("Folder Apache belum ada — vhost Apache dilewati.")
         if self.write_nginx_sites(sites):
             self.log(f"Virtual host Nginx ditulis ({len(sites)} situs + localhost).")
-        self._write_hosts([h for h, _ in sites])
+        self._write_hosts([h for s in sites for h in [s.host, *s.aliases]])
+        if restart:
+            self.restart_web_servers()
+        self.ui(self.refresh_sites)  # aman dipanggil dari thread (mis. setelah composer)
+
+    def restart_web_servers(self):
         for name in ("Apache", "Nginx"):
             s = self.svc(name)
             if s and s.running:
                 self.log(f"Restart {name} untuk menerapkan perubahan…")
                 threading.Thread(target=lambda s=s: (s.stop(), s.start()), daemon=True).start()
-        self.ui(self.refresh_sites)  # aman dipanggil dari thread (mis. setelah composer)
+
+    def test_server_configs(self):
+        """Uji konfigurasi Apache/Nginx yang terpasang (httpd -t / nginx -t).
+        Kembalikan teks error, atau '' bila semua lolos / tidak ada yang bisa diuji."""
+        errors = []
+        a = self.svc("Apache")
+        if a and a.available and os.path.isfile(os.path.join(APACHE, "conf", "httpd.conf")):
+            self.prepare_apache()  # pastikan Include, modul PHP, dan vhost terbaru terpasang
+            r = subprocess.run([a.exe, "-t"], cwd=a.cwd, capture_output=True, text=True, errors="replace",
+                               env=tool_env(), creationflags=NO_WINDOW)
+            if r.returncode != 0:
+                errors.append("Apache:\n" + ((r.stderr or "") + (r.stdout or "")).strip())
+        n = self.svc("Nginx")
+        if n and n.available and os.path.isfile(os.path.join(NGINX, "conf", "nginx.conf")):
+            self.configure_nginx()
+            r = subprocess.run([n.exe, "-t"], cwd=n.cwd, capture_output=True, text=True, errors="replace",
+                               creationflags=NO_WINDOW)
+            if r.returncode != 0:
+                errors.append("Nginx:\n" + ((r.stderr or "") + (r.stdout or "")).strip())
+        return "\n\n".join(errors)
 
     def _write_hosts(self, hosts):
         try:
