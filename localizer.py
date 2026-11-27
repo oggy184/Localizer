@@ -15,6 +15,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -383,33 +384,114 @@ def component_installed(name):
     return False
 
 
+def _run_version(cmd, pattern):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=15,
+                           creationflags=NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(pattern, (r.stdout or "") + (r.stderr or ""))
+    return m.group(1) if m else None
+
+
 def php_version_of(php_dir):
     exe = os.path.join(php_dir, "php" + EXE)
     if not os.path.isfile(exe):
         return None
-    try:
-        out = subprocess.run([exe, "-n", "-r", "echo PHP_VERSION;"], capture_output=True, text=True,
-                             timeout=10, creationflags=NO_WINDOW).stdout.strip()
-        return out or None
-    except (OSError, subprocess.TimeoutExpired):
+    return _run_version([exe, "-n", "-r", "echo PHP_VERSION;"], r"(\d+\.\d+\.\d+\S*)")
+
+
+def installed_version(name):
+    """Versi komponen yang terpasang, atau None."""
+    if name == "apache":
+        exe = os.path.join(APACHE, "bin", "httpd.exe")
+        return _run_version([exe, "-v"], r"Apache/(\d+\.\d+\.\d+)") if os.path.isfile(exe) else None
+    if name == "mariadb":
+        for n in ("mariadbd.exe", "mysqld.exe"):
+            exe = os.path.join(MYSQL, "bin", n)
+            if os.path.isfile(exe):
+                return _run_version([exe, "--version"], r"(\d+\.\d+\.\d+)-MariaDB")
         return None
+    if name == "phpmyadmin":
+        if not pma_ready():
+            return None
+        for rel, pat in (("libraries/classes/Version.php", r"VERSION\s*=\s*'([\d.]+)"),
+                         ("src/Version.php", r"VERSION\s*=\s*'([\d.]+)"),
+                         ("README", r"Version\s+([\d.]+)")):
+            path = os.path.join(PMA, rel)
+            if os.path.isfile(path):
+                m = re.search(pat, read_text(path))
+                if m:
+                    return m.group(1)
+        return "?"
+    return None
 
 
+def branch_of(ver):
+    """'8.4.15' -> '8.4'"""
+    return ".".join(ver.split(".")[:2])
+
+
+# --- versi terbaru dari situs resmi ---
+def latest_apache():
+    """(versi, url, vs) Apache terbaru di Apache Lounge."""
+    html = http_get(APACHE_PAGE).decode("utf-8", "replace")
+    links = re.findall(r'href="([^"]*?httpd-(2\.4\.\d+)-[^"]*?win64-VS(\d+)\.zip)"', html, re.I)
+    if not links:
+        raise RuntimeError(f"link unduhan tidak ditemukan di {APACHE_PAGE}")
+    href, ver, vs = max(links, key=lambda l: (int(l[2]), vtuple(l[1])))  # VS & versi terbaru
+    return ver, urljoin(APACHE_PAGE, href), vs
+
+
+def php_releases():
+    """{cabang: {'version': ..., 'pkg': {...}, 'build': 'ts-vs17-x64'}} hanya yang punya build TS x64."""
+    out = {}
+    for branch, info in http_json(PHP_RELEASES + "releases.json").items():
+        keys = sorted((k for k in info if re.fullmatch(r"ts-vs\d+-x64", k)), key=vtuple)
+        if keys:
+            out[branch] = {"version": info["version"], "pkg": info[keys[-1]]["zip"], "build": keys[-1]}
+    return out
+
+
+def mariadb_branches():
+    """(daftar cabang stabil terbaru dulu, cabang LTS terbaru)."""
+    majors = http_json(MARIADB_API)["major_releases"]
+    stable = [m for m in majors if m["release_status"] == "Stable"]
+    lts = max((m["release_id"] for m in stable if m.get("release_support_type") == "Long Term Support"),
+              key=vtuple)
+    return sorted((m["release_id"] for m in stable), key=vtuple, reverse=True), lts
+
+
+def mariadb_latest(branch):
+    """(versi, info_file_zip) rilis terbaru satu cabang MariaDB."""
+    ver, rel = next(iter(http_json(f"{MARIADB_API}{branch}/latest/")["releases"].items()))
+    pkg = next((f for f in rel["files"] if re.fullmatch(r"mariadb-[\d.]+-winx64\.zip", f["file_name"])), None)
+    if not pkg:
+        raise RuntimeError(f"ZIP Windows untuk MariaDB {ver} tidak ditemukan")
+    return ver, pkg
+
+
+def pma_latest():
+    info = http_json(PMA_VERSION)
+    return info["version"], info
+
+
+# --- pemasangan / pembaruan ---
 def install_apache(dl_dir, log, force=False, progress=None):
     if component_installed("apache") and not force:
         log(f"Apache sudah ada di {APACHE}.")
         return True
     log("Mencari Apache terbaru di Apache Lounge…")
-    html = http_get(APACHE_PAGE).decode("utf-8", "replace")
-    links = re.findall(r'href="([^"]*?httpd-(2\.4\.\d+)-[^"]*?win64-VS(\d+)\.zip)"', html, re.I)
-    if not links:
-        log(f"  Link unduhan tidak ditemukan. Unduh manual dari {APACHE_PAGE}")
-        return False
-    href, ver, vs = max(links, key=lambda l: (int(l[2]), vtuple(l[1])))  # VS & versi terbaru
-    url = urljoin(APACHE_PAGE, href)
+    ver, url, vs = latest_apache()
     zip_path = os.path.join(dl_dir, url.rsplit("/", 1)[-1])
     log(f"Mengunduh Apache {ver} (VS{vs})…")
-    download_file(url, zip_path, log, progress=progress)  # Apache Lounge tidak menyediakan checksum yang mudah dibaca
+    download_file(url, zip_path, log, progress=progress)  # Apache Lounge tidak menyediakan checksum
+    conf = os.path.join(APACHE, "conf")
+    if os.path.isdir(conf):  # simpan konfigurasi lama (bisa berisi editan manual)
+        backup = os.path.join(os.path.dirname(APACHE), "apache-conf-cadangan")
+        shutil.rmtree(backup, ignore_errors=True)
+        shutil.copytree(conf, backup)
+        log(f"Konfigurasi Apache lama dicadangkan ke {backup}")
     clear_dir(APACHE)
     log("Mengekstrak Apache…")
     extract_zip(zip_path, APACHE, strip_prefix="Apache24/")
@@ -421,9 +503,10 @@ def install_apache(dl_dir, log, force=False, progress=None):
 
 
 def install_php(dl_dir, log, branches=None, force=False, progress=None):
-    """Pasang PHP Thread Safe x64; kembalikan [(versi, path_relatif)] yang terpasang."""
+    """Pasang PHP Thread Safe x64 per cabang (mis. 8.4) ke bin/php/php-<versi>;
+    kembalikan [(versi, path_relatif)] yang terpasang."""
     log("Mengambil daftar rilis PHP…")
-    releases = http_json(PHP_RELEASES + "releases.json")
+    releases = php_releases()
     available = sorted(releases, key=vtuple)
     installed = []
     for branch in branches or [available[-1]]:
@@ -431,11 +514,7 @@ def install_php(dl_dir, log, branches=None, force=False, progress=None):
         if not info:
             log(f"PHP {branch} tidak tersedia. Pilihan: {', '.join(available)}")
             continue
-        keys = sorted((k for k in info if re.fullmatch(r"ts-vs\d+-x64", k)), key=vtuple)
-        if not keys:
-            log(f"PHP {branch}: build Thread Safe x64 tidak ditemukan.")
-            continue
-        pkg, ver = info[keys[-1]]["zip"], info["version"]
+        pkg, ver = info["pkg"], info["version"]
         rel = f"bin/php/php-{ver}"
         dest = os.path.join(BASE, rel)
         if os.path.isfile(os.path.join(dest, "php.exe")) and not force:
@@ -443,7 +522,7 @@ def install_php(dl_dir, log, branches=None, force=False, progress=None):
             installed.append((ver, rel))
             continue
         zip_path = os.path.join(dl_dir, pkg["path"])
-        log(f"Mengunduh PHP {ver} ({keys[-1]})…")
+        log(f"Mengunduh PHP {ver} ({info['build']})…")
         download_file(PHP_RELEASES + pkg["path"], zip_path, log, pkg.get("sha256"), progress)
         clear_dir(dest, keep=("php.ini",))  # ekstensi yang sudah diaktifkan dipertahankan
         log("Mengekstrak PHP…")
@@ -458,20 +537,12 @@ def install_mariadb(dl_dir, log, branch=None, force=False, progress=None):
         log(f"MariaDB sudah ada di {MYSQL}.")
         return True
     log("Mengambil daftar rilis MariaDB…")
-    majors = http_json(MARIADB_API)["major_releases"]
-    if branch:
-        if branch not in {m["release_id"] for m in majors}:
-            log(f"MariaDB {branch} tidak tersedia. Pilihan stabil: "
-                + ", ".join(m["release_id"] for m in majors if m["release_status"] == "Stable"))
-            return False
-    else:  # LTS stabil terbaru
-        branch = max((m["release_id"] for m in majors if m["release_status"] == "Stable"
-                      and m.get("release_support_type") == "Long Term Support"), key=vtuple)
-    ver, rel = next(iter(http_json(f"{MARIADB_API}{branch}/latest/")["releases"].items()))
-    pkg = next((f for f in rel["files"] if re.fullmatch(r"mariadb-[\d.]+-winx64\.zip", f["file_name"])), None)
-    if not pkg:
-        log(f"  ZIP Windows untuk MariaDB {ver} tidak ditemukan.")
+    stable, lts = mariadb_branches()
+    branch = branch or lts
+    if branch not in stable:
+        log(f"MariaDB {branch} tidak tersedia. Pilihan stabil: {', '.join(stable)}")
         return False
+    ver, pkg = mariadb_latest(branch)
     zip_path = os.path.join(dl_dir, pkg["file_name"])
     log(f"Mengunduh MariaDB {ver}…")
     download_file(pkg["file_download_url"], zip_path, log, pkg.get("checksum", {}).get("sha256sum"),
@@ -488,7 +559,7 @@ def install_mariadb(dl_dir, log, branch=None, force=False, progress=None):
                 save_config(CFG)
                 log(f"config.json: MariaDB sekarang memakai {exe}.")
                 break
-    log(f"MariaDB {ver} terpasang (user root, password kosong; data dibuat saat start pertama).")
+    log(f"MariaDB {ver} terpasang (user root, password kosong; data lama tetap dipakai).")
     return True
 
 
@@ -497,8 +568,7 @@ def install_phpmyadmin(dl_dir, log, force=False, progress=None):
         log(f"phpMyAdmin sudah ada di {PMA}.")
         return True
     log("Mengambil versi phpMyAdmin terbaru…")
-    info = http_json(PMA_VERSION)
-    ver = info["version"]
+    ver, info = pma_latest()
     name = f"phpMyAdmin-{ver}-all-languages.zip"
     sha = http_get(f"{PMA_FILES}{ver}/{name}.sha256").decode().split()[0]
     zip_path = os.path.join(dl_dir, name)
@@ -520,8 +590,8 @@ def install_phpmyadmin(dl_dir, log, force=False, progress=None):
                 ok &= {">=": a >= b, "<=": a <= b, ">": a > b, "<": a < b}[m.group(1)]
         if not ok:
             log(f"  Catatan: phpMyAdmin {ver} resmi mendukung PHP {rel['php_versions']}, PHP aktif {php_ver}. "
-                f"Biasanya tetap jalan; bila ada error, unduh PHP versi lebih lama lalu aktifkan di "
-                f"halaman PHP.")
+                f"Biasanya tetap jalan; bila ada error, pasang PHP versi lebih lama di halaman Komponen "
+                f"lalu aktifkan di halaman PHP.")
     return True
 
 
@@ -879,7 +949,8 @@ F_VALUE = (FONT, 16, "bold")
 
 # ikon dari font Segoe MDL2 Assets (bawaan Windows 10/11)
 ICONS = {"dashboard": "", "sites": "", "services": "", "php": "",
-         "log": "", "settings": "", "exit": ""}
+         "components": "", "log": "", "settings": "",
+         "exit": ""}
 
 SERVICE_INFO = {
     "Apache": "Web server",
@@ -1009,6 +1080,9 @@ class App(tk.Tk):
         st.configure("TCheckbutton", background=C_BG, padding=(0, 4))
         st.map("TCheckbutton", background=[("active", C_BG)])
         st.configure("TEntry", padding=(8, 6), fieldbackground="white")
+        st.configure("TCombobox", padding=(6, 4), fieldbackground="white", arrowsize=self.px(12))
+        st.map("TCombobox", fieldbackground=[("readonly", "white")], selectbackground=[("readonly", "white")],
+               selectforeground=[("readonly", C_TEXT)])
         st.configure("Treeview", rowheight=self.px(36), fieldbackground=C_BG, background=C_BG, borderwidth=0)
         st.configure("Treeview.Heading", font=F_SMALL, background="#f9fafb", foreground=C_MUTED,
                      relief="flat", padding=(8, 6), bordercolor=C_BORDER, lightcolor="#f9fafb",
@@ -1042,7 +1116,8 @@ class App(tk.Tk):
 
         self.nav = {}
         for key, text in [("dashboard", "Dashboard"), ("sites", "Situs"), ("services", "Layanan"),
-                          ("php", "PHP"), ("log", "Log"), ("settings", "Pengaturan")]:
+                          ("php", "PHP"), ("components", "Komponen"), ("log", "Log"),
+                          ("settings", "Pengaturan")]:
             self.nav[key] = self._nav_item(side, key, text)
 
         bottom = tk.Frame(side, bg=C_SIDEBAR)
@@ -1059,7 +1134,8 @@ class App(tk.Tk):
         self.pages = {}
         for key, builder in [("dashboard", self._page_dashboard), ("sites", self._page_sites),
                              ("services", self._page_services), ("php", self._page_php),
-                             ("log", self._page_log), ("settings", self._page_settings)]:
+                             ("components", self._page_components), ("log", self._page_log),
+                             ("settings", self._page_settings)]:
             page = tk.Frame(self.content, bg=C_BG)
             page.grid(row=0, column=0, sticky="nsew", padx=32, pady=26)
             builder(page)
@@ -1112,6 +1188,10 @@ class App(tk.Tk):
             self.refresh_sites()
         elif key == "php":
             self.refresh_php_versions()
+        elif key == "components":
+            self.refresh_components()
+            if not self.comp_latest and not self._checking:
+                self.check_updates()  # periksa versi terbaru saat halaman pertama kali dibuka
 
     # --- komponen halaman ---
     def _header(self, page, title, subtitle, buttons=()):
@@ -1460,7 +1540,7 @@ class App(tk.Tk):
             status = tk.Label(card, text="", font=F_SMALL, bg=C_BG, fg=C_MUTED, width=16, anchor="e")
             status.pack(side="right")
             self.svc_rows[svc.name] = (dot, desc, status, toggle)
-        tk.Label(page, text="Layanan yang belum terpasang bisa diunduh lewat Pengaturan → Unduh Komponen.",
+        tk.Label(page, text="Layanan yang belum terpasang bisa dipasang lewat halaman Komponen.",
                  font=F_SMALL, bg=C_BG, fg=C_MUTED, anchor="w").pack(fill="x", pady=(6, 0))
 
     def _refresh_status(self):
@@ -1498,7 +1578,7 @@ class App(tk.Tk):
         self._header(page, "PHP", "Kelola versi PHP. Versi aktif dipakai Apache, Nginx, dan terminal.",
                      [("Folder PHP", lambda: self.open_path(PHP), False),
                       ("Edit php.ini", self.edit_php_ini, False),
-                      ("Unduh versi PHP…", self.open_download_dialog, True)])
+                      ("Pasang versi PHP lain…", lambda: self.show_page("components"), True)])
         self.php_list = tk.Frame(page, bg=C_BG)
         self.php_list.pack(fill="x")
         exts = ", ".join(CFG.get("php_extensions", []))
@@ -1512,7 +1592,7 @@ class App(tk.Tk):
             w.destroy()
         if not self.php_versions:
             card = self._card(self.php_list, fill="x")
-            tk.Label(card, text="Belum ada PHP terpasang. Klik \"Unduh versi PHP…\".", font=F_BODY,
+            tk.Label(card, text="Belum ada PHP terpasang. Klik \"Pasang versi PHP lain…\".", font=F_BODY,
                      bg=C_BG, fg=C_MUTED).pack(padx=16, pady=18, anchor="w")
         for rel, label in self.php_versions:
             ver = label.split()[0]
@@ -1594,8 +1674,8 @@ class App(tk.Tk):
         self._section(page, "Komponen")
         r = tk.Frame(page, bg=C_BG)
         r.pack(fill="x")
-        ttk.Button(r, text="Unduh Komponen…", style="Accent.TButton",
-                   command=self.open_download_dialog).pack(side="left")
+        ttk.Button(r, text="Pasang & perbarui komponen…", style="Accent.TButton",
+                   command=lambda: self.show_page("components")).pack(side="left")
         ttk.Button(r, text="Sinkronkan Virtual Host", command=self.sync_vhosts).pack(side="left", padx=8)
         ttk.Button(r, text="Edit config.json", command=self.edit_config).pack(side="left")
 
@@ -1647,7 +1727,7 @@ class App(tk.Tk):
                                    f"langsung ke {PMA})")
         if missing:
             self.log("Komponen belum terpasang:\n" + "\n".join(missing)
-                     + "\n  Buka Pengaturan → Unduh Komponen untuk mengunduh otomatis.")
+                     + "\n  Buka halaman Komponen untuk memasangnya otomatis.")
 
     # ---------- versi PHP ----------
     def set_php(self, rel):
@@ -1678,88 +1758,240 @@ class App(tk.Tk):
         """Jalankan fn di thread GUI (aman dipanggil dari thread mana pun)."""
         self.logq.put(fn)
 
-    def open_download_dialog(self):
-        if getattr(self, "_downloading", False):
-            messagebox.showinfo("Unduh", "Unduhan masih berjalan — lihat progresnya di bagian bawah jendela.")
+    # ---------- halaman Komponen: pasang & perbarui ----------
+    def _page_components(self, page):
+        self._header(page, "Komponen", "Pasang dan perbarui komponen langsung dari situs resminya.",
+                     [("Periksa pembaruan", self.check_updates, True)])
+        self.comp_status = tk.Label(page, text="Belum diperiksa.", font=F_SMALL, bg=C_BG, fg=C_MUTED, anchor="w")
+        self.comp_status.pack(fill="x", pady=(0, 10))
+        self.comp_list = tk.Frame(page, bg=C_BG)
+        self.comp_list.pack(fill="x")
+        self.comp_latest = {}
+        self.comp_errors = {}
+        self._checking = False
+
+    def _comp_card(self, title, desc):
+        card = self._card(self.comp_list, fill="x", pady=(0, 10))
+        head = tk.Frame(card, bg=C_BG)
+        head.pack(fill="x", padx=16, pady=(12, 10))
+        txt = tk.Frame(head, bg=C_BG)
+        txt.pack(side="left", fill="x", expand=True)
+        tk.Label(txt, text=title, font=F_BOLD, bg=C_BG, fg=C_TEXT, anchor="w").pack(fill="x")
+        tk.Label(txt, text=desc, font=F_SMALL, bg=C_BG, fg=C_MUTED, anchor="w").pack(fill="x")
+        right = tk.Frame(head, bg=C_BG)
+        right.pack(side="right")
+        return card, right
+
+    def _comp_state(self, parent, installed, latest, on_install, on_update, install_text="Pasang"):
+        """Status + tombol untuk satu komponen/versi: Pasang / Perbarui / Terbaru."""
+        busy = self._downloading
+        if not installed:
+            tk.Label(parent, text="Belum terpasang", font=F_SMALL, bg=C_BG, fg=C_GRAY).pack(side="left", padx=10)
+            ttk.Button(parent, text=install_text, style="Accent.TButton", command=on_install,
+                       state="disabled" if busy else "normal").pack(side="left")
+        elif latest and vtuple(latest) > vtuple(installed):
+            tk.Label(parent, text=f"{installed}  →  {latest}", font=F_SMALL, bg=C_BG, fg=C_ACCENT).pack(
+                side="left", padx=10)
+            ttk.Button(parent, text="Perbarui", style="Accent.TButton", command=on_update,
+                       state="disabled" if busy else "normal").pack(side="left")
+        elif latest:
+            tk.Label(parent, text=installed, font=F_SMALL, bg=C_BG, fg=C_MUTED).pack(side="left", padx=10)
+            tk.Label(parent, text="  Terbaru  ", font=F_SMALL, bg=C_GREEN_SOFT, fg="#027a48").pack(side="left")
+        else:
+            tk.Label(parent, text=f"Terpasang  {installed}", font=F_SMALL, bg=C_BG, fg=C_MUTED).pack(side="left")
+
+    def refresh_components(self):
+        for w in self.comp_list.winfo_children():
+            w.destroy()
+        L = self.comp_latest
+
+        # Apache
+        _, right = self._comp_card("Apache", "Web server · build Apache Lounge (x64)")
+        self._comp_state(right, installed_version("apache"), L.get("apache"),
+                         lambda: self.start_job("Apache", lambda d, log, p: install_apache(d, log, True, p),
+                                                stop=["Apache"]),
+                         lambda: self.start_job("Apache", lambda d, log, p: install_apache(d, log, True, p),
+                                                stop=["Apache"]))
+
+        # PHP: satu baris per versi terpasang + pasang cabang lain
+        card, right = self._comp_card("PHP", "Thread Safe x64 · bisa lebih dari satu versi")
+        releases = L.get("php") or {}
+        php_rows = [(rel, label.split()[0]) for rel, label in find_php_versions()]
+        installed_vers = {v for _, v in php_rows}
+        for rel, ver in php_rows:
+            row = tk.Frame(card, bg=C_BG)
+            row.pack(fill="x", padx=16, pady=(0, 8))
+            active = same_path(os.path.join(BASE, rel), PHP)
+            tk.Label(row, text=f"PHP {ver}" + ("   (aktif)" if active else ""), font=F_BODY, bg=C_BG,
+                     fg=C_TEXT, anchor="w").pack(side="left")
+            latest = (releases.get(branch_of(ver)) or {}).get("version")
+            if latest and latest in installed_vers and latest != ver:
+                tk.Label(row, text=f"versi lebih baru ({latest}) sudah terpasang", font=F_SMALL, bg=C_BG,
+                         fg=C_MUTED).pack(side="right")
+                continue
+            right_row = tk.Frame(row, bg=C_BG)
+            right_row.pack(side="right")
+            self._comp_state(right_row, ver, latest, None,
+                             lambda b=branch_of(ver), r=rel: self.start_job(
+                                 f"PHP {b}", lambda d, log, p: self._job_php(d, log, p, b, r)))
+        if not php_rows:
+            tk.Label(right, text="Belum terpasang", font=F_SMALL, bg=C_BG, fg=C_GRAY).pack(side="left")
+        add = tk.Frame(card, bg=C_BG)
+        add.pack(fill="x", padx=16, pady=(0, 12))
+        tk.Label(add, text="Pasang versi PHP:", font=F_SMALL, bg=C_BG, fg=C_MUTED).pack(side="left")
+        branches = sorted(releases, key=vtuple, reverse=True)
+        php_var = tk.StringVar(value=next((b for b in branches
+                                           if releases[b]["version"] not in installed_vers), branches[0])
+                               if branches else "terbaru")
+        ttk.Combobox(add, textvariable=php_var, width=10, state="readonly",
+                     values=branches or ["terbaru"]).pack(side="left", padx=8)
+        ttk.Button(add, text="Pasang", style="Small.TButton",
+                   state="disabled" if self._downloading else "normal",
+                   command=lambda: self.start_job(
+                       f"PHP {php_var.get()}",
+                       lambda d, log, p, b=php_var.get(): self._job_php(d, log, p, None if b == "terbaru" else b))
+                   ).pack(side="left")
+
+        # MariaDB: pembaruan hanya di cabang yang sama (pindah cabang butuh migrasi data)
+        card, right = self._comp_card("MariaDB", "Database (kompatibel MySQL) · data di bin/mysql/data tetap aman")
+        m = L.get("mariadb") or {}
+        inst = installed_version("mariadb")
+        if inst:
+            self._comp_state(right, inst, (m.get("latest") or {}).get(branch_of(inst)), None,
+                             lambda b=branch_of(inst): self.start_job(
+                                 f"MariaDB {b}", lambda d, log, p: install_mariadb(d, log, b, True, p),
+                                 stop=["MariaDB"]))
+            tk.Label(card, text=f"Pembaruan otomatis hanya di cabang {branch_of(inst)}. Pindah ke cabang lain "
+                                f"perlu migrasi data dan tidak dilakukan otomatis.",
+                     font=F_SMALL, bg=C_BG, fg=C_MUTED, anchor="w").pack(fill="x", padx=16, pady=(0, 12))
+        else:
+            stable, lts = m.get("stable") or [], m.get("lts")
+            db_var = tk.StringVar(value=lts or "LTS terbaru")
+            ttk.Combobox(right, textvariable=db_var, width=10, state="readonly",
+                         values=stable or ["LTS terbaru"]).pack(side="left", padx=(0, 8))
+            self._comp_state(right, None, None,
+                             lambda: self.start_job(
+                                 "MariaDB", lambda d, log, p, b=db_var.get(): install_mariadb(
+                                     d, log, None if b == "LTS terbaru" else b, True, p), stop=["MariaDB"]),
+                             None)
+
+        # phpMyAdmin
+        _, right = self._comp_card("phpMyAdmin", "Kelola database lewat browser · config login tetap dipakai")
+        job = lambda: self.start_job("phpMyAdmin", lambda d, log, p: install_phpmyadmin(d, log, True, p))
+        self._comp_state(right, installed_version("phpmyadmin"), L.get("phpmyadmin"), job, job)
+
+        # Visual C++ Redistributable (dibutuhkan semua komponen di atas)
+        card, right = self._comp_card("Visual C++ Redistributable x64",
+                                      "Dibutuhkan Apache, PHP, dan MariaDB · dipasang lewat installer Microsoft")
+        if vc_redist_missing():
+            tk.Label(right, text="Belum terpasang", font=F_SMALL, bg=C_BG, fg=C_RED).pack(side="left", padx=10)
+            ttk.Button(right, text="Unduh installer", style="Accent.TButton",
+                       command=lambda: webbrowser.open(VC_REDIST)).pack(side="left")
+        else:
+            tk.Label(right, text="  Terpasang  ", font=F_SMALL, bg=C_GREEN_SOFT, fg="#027a48").pack(side="left")
+
+        for name, err in self.comp_errors.items():
+            tk.Label(self.comp_list, text=f"Gagal memeriksa {COMPONENT_LABELS[name]}: {err}", font=F_SMALL,
+                     bg=C_BG, fg=C_RED, anchor="w", wraplength=self.px(760), justify="left").pack(fill="x")
+
+    def _job_php(self, dl_dir, log, progress, branch, old_rel=None):
+        """Pasang PHP satu cabang; bila old_rel (versi lama) sedang aktif, pindah ke versi baru."""
+        installed = install_php(dl_dir, log, [branch] if branch else None, progress=progress)
+        if not installed:
+            return False
+        new_rel = installed[0][1]
+        if not os.path.isfile(os.path.join(PHP, "php" + EXE)) or (old_rel and same_path(
+                os.path.join(BASE, old_rel), PHP)):
+            self.set_php(new_rel)
+        if old_rel and not same_path(os.path.join(BASE, old_rel), os.path.join(BASE, new_rel)):
+            log(f"Versi lama tetap ada di {old_rel}; hapus foldernya bila tidak diperlukan lagi.")
+        return True
+
+    def check_updates(self):
+        if self._checking:
             return
-        dlg = tk.Toplevel(self)
-        dlg.title("Unduh Komponen")
-        dlg.transient(self)
-        dlg.resizable(False, False)
-        frm = ttk.Frame(dlg, padding=14)
-        frm.pack(fill="both")
+        self._checking = True
+        self.comp_status.configure(text="Memeriksa versi terbaru…", fg=C_ACCENT)
 
-        ttk.Label(frm, text="Pilih komponen yang akan diunduh:").grid(row=0, column=0, columnspan=2, sticky="w")
-        checks = {}
-        for i, name in enumerate(COMPONENTS, start=1):
-            done = component_installed(name)
-            checks[name] = tk.BooleanVar(value=not done)
-            ttk.Checkbutton(frm, text=COMPONENT_LABELS[name] + ("  (sudah ada)" if done else ""),
-                            variable=checks[name]).grid(row=i, column=0, columnspan=2, sticky="w", pady=1)
+        def work():
+            latest, errors = {}, {}
+            for name, fn in (("apache", lambda: latest_apache()[0]), ("php", php_releases),
+                             ("phpmyadmin", lambda: pma_latest()[0])):
+                try:
+                    latest[name] = fn()
+                except Exception as e:
+                    errors[name] = str(e)
+            try:
+                stable, lts = mariadb_branches()
+                inst = installed_version("mariadb")
+                wanted = {lts} | ({branch_of(inst)} if inst else set())
+                latest["mariadb"] = {"stable": stable, "lts": lts,
+                                     "latest": {b: mariadb_latest(b)[0] for b in wanted if b in stable}}
+            except Exception as e:
+                errors["mariadb"] = str(e)
+            self.ui(lambda: self._updates_checked(latest, errors))
 
-        row = len(COMPONENTS) + 1
-        ttk.Label(frm, text="Versi PHP (mis. 8.3 8.4):").grid(row=row, column=0, sticky="w", pady=(10, 2))
-        php_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=php_var, width=16).grid(row=row, column=1, sticky="w", pady=(10, 2))
-        ttk.Label(frm, text="Versi MariaDB (mis. 11.4):").grid(row=row + 1, column=0, sticky="w", pady=2)
-        db_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=db_var, width=16).grid(row=row + 1, column=1, sticky="w", pady=2)
-        ttk.Label(frm, text="Kosongkan untuk versi terbaru (MariaDB: LTS terbaru).",
-                  foreground="#666").grid(row=row + 2, column=0, columnspan=2, sticky="w")
-        force_var = tk.BooleanVar()
-        ttk.Checkbutton(frm, text="Timpa yang sudah ada (database, php.ini, config phpMyAdmin tetap aman)",
-                        variable=force_var).grid(row=row + 3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        threading.Thread(target=work, daemon=True).start()
 
-        def start():
-            chosen = [n for n in COMPONENTS if checks[n].get()]
-            if not chosen:
-                messagebox.showwarning("Unduh", "Pilih minimal satu komponen.", parent=dlg)
-                return
-            php_branches = php_var.get().replace(",", " ").split()
-            busy = self._services_blocking_download(chosen, force_var.get())
-            if busy:
-                messagebox.showwarning("Unduh", "Hentikan dulu layanan berikut karena file-nya akan diganti:\n"
-                                       + ", ".join(busy), parent=dlg)
-                return
-            dlg.destroy()
-            self._downloading = True
-            self._dl_show("Menyiapkan unduhan…", ", ".join(COMPONENT_LABELS[n] for n in chosen))
-            threading.Thread(target=self._run_downloads, daemon=True,
-                             args=(chosen, php_branches, db_var.get().strip() or None,
-                                   force_var.get())).start()
+    def _updates_checked(self, latest, errors):
+        self._checking = False
+        self.comp_latest, self.comp_errors = latest, errors
+        self.refresh_components()
+        n = self._count_updates()
+        when = time.strftime("%H:%M")
+        if errors:
+            self.comp_status.configure(text=f"Diperiksa pukul {when}; sebagian gagal diperiksa (lihat di bawah).",
+                                       fg=C_RED)
+        elif not any(component_installed(c) for c in COMPONENTS):
+            self.comp_status.configure(text=f"Diperiksa pukul {when}. Belum ada komponen terpasang — "
+                                            f"klik Pasang pada komponen yang dibutuhkan.", fg=C_MUTED)
+        else:
+            self.comp_status.configure(
+                text=f"Diperiksa pukul {when}. " + (f"{n} pembaruan tersedia." if n else "Semua sudah terbaru."),
+                fg=C_ACCENT if n else C_MUTED)
 
-        btns = ttk.Frame(frm)
-        btns.grid(row=row + 4, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(btns, text="Batal", command=dlg.destroy).pack(side="right")
-        ttk.Button(btns, text="Unduh", command=start).pack(side="right", padx=(0, 6))
-        dlg.grab_set()
+    def _count_updates(self):
+        L, n = self.comp_latest, 0
+        for name in ("apache", "phpmyadmin"):
+            inst = installed_version(name)
+            n += bool(inst and L.get(name) and inst != "?" and vtuple(L[name]) > vtuple(inst))
+        inst = installed_version("mariadb")
+        latest = ((L.get("mariadb") or {}).get("latest") or {}).get(branch_of(inst)) if inst else None
+        n += bool(latest and vtuple(latest) > vtuple(inst))
+        vers = {label.split()[0] for _, label in find_php_versions()}
+        for ver in vers:
+            latest = ((L.get("php") or {}).get(branch_of(ver)) or {}).get("version")
+            n += bool(latest and latest not in vers and vtuple(latest) > vtuple(ver))
+        return n
 
-    def _services_blocking_download(self, chosen, force):
-        """Layanan yang sedang jalan dan file-nya akan ditimpa (file exe yang berjalan terkunci)."""
-        names = set()
-        if "apache" in chosen and (force or not component_installed("apache")):
-            names.add("Apache")
-        if "mariadb" in chosen and (force or not component_installed("mariadb")):
-            names.add("MariaDB")
-        if "php" in chosen and force:  # tanpa timpa, versi baru masuk ke folder baru
-            names.update(("Apache", "PHP-CGI", "PHP Server"))
-        return sorted(s.name for s in self.services if s.name in names and s.running)
+    def start_job(self, title, fn, stop=()):
+        """Jalankan pemasangan/pembaruan di latar belakang. Layanan di `stop` yang sedang jalan
+        dihentikan dulu (file exe yang berjalan terkunci) lalu dinyalakan lagi setelah selesai."""
+        if self._downloading:
+            messagebox.showinfo("Komponen", "Masih ada proses yang berjalan — lihat panel di bagian bawah.")
+            return
+        running = [s for s in self.services if s.name in stop and s.running]
+        if running and not messagebox.askyesno(
+                "Komponen", f"{', '.join(s.name for s in running)} sedang berjalan dan perlu dihentikan "
+                            f"sementara. Lanjutkan? (akan dinyalakan lagi setelah selesai)"):
+            return
+        self._downloading = True
+        self._dl_show(f"Menyiapkan {title}…", "")
+        if self.current_page == "components":
+            self.refresh_components()  # nonaktifkan tombol selama proses
+        threading.Thread(target=self._run_job, args=(title, fn, running), daemon=True).start()
 
-    def _run_downloads(self, chosen, php_branches, mariadb_branch, force):
+    def _run_job(self, title, fn, restart):
         dl_dir = os.path.join(BASE, "bin", "_unduhan")
-        todo = [n for n in COMPONENTS if n in chosen]  # urutan tetap: PHP sebelum phpMyAdmin
-        failed, done_names = [], []
-        state = {"step": "", "pct": -1}
-
-        def status(title, indeterminate=True):
-            self.ui(lambda: self._dl_show(title, state["step"], None if indeterminate else 0))
+        state = {"pct": -1}
 
         def dlog(msg):
             """Log biasa + judul panel progres untuk tahap-tahap penting."""
             self.log(msg)
             if msg.startswith(("Mencari", "Mengambil", "Mengunduh", "Mengekstrak")):
                 state["pct"] = -1
-                status(msg, indeterminate=not msg.startswith("Mengunduh"))
+                indeterminate = not msg.startswith("Mengunduh")
+                self.ui(lambda: self._dl_show(msg, title, None if indeterminate else 0))
 
         def progress(done, total):
             pct = done * 100 // total if total else -1
@@ -1767,58 +1999,40 @@ class App(tk.Tk):
                 return  # perbarui UI hanya bila persen berubah
             state["pct"] = pct
             size = f"{done / 1048576:.1f} / {total / 1048576:.1f} MB" if total else f"{done / 1048576:.1f} MB"
-            detail = f"{state['step']}  ·  {size}" + (f"  ·  {pct}%" if total else "")
+            detail = f"{title}  ·  {size}" + (f"  ·  {pct}%" if total else "")
             self.ui(lambda: self._dl_progress(pct, detail))
 
+        ok, error = False, ""
         try:
+            for s in restart:
+                self.log(f"Menghentikan {s.name} sementara…")
+                s.stop()
             os.makedirs(dl_dir, exist_ok=True)
-            for i, name in enumerate(todo, start=1):
-                label = COMPONENT_LABELS[name]
-                state["step"] = f"Komponen {i} dari {len(todo)}: {label}"
-                self.log(f"=== Unduh {label} ===")
-                status(f"Menyiapkan {label}…")
-                try:
-                    if name == "apache":
-                        ok = install_apache(dl_dir, dlog, force, progress)
-                    elif name == "php":
-                        installed = install_php(dl_dir, dlog, php_branches, force, progress)
-                        ok = bool(installed)
-                        # aktifkan versi tertinggi bila PHP aktif belum ada
-                        if installed and not os.path.isfile(os.path.join(PHP, "php" + EXE)):
-                            self.set_php(max(installed, key=lambda x: vtuple(x[0]))[1])
-                    elif name == "mariadb":
-                        ok = install_mariadb(dl_dir, dlog, mariadb_branch, force, progress)
-                    else:
-                        ok = install_phpmyadmin(dl_dir, dlog, force, progress)
-                except Exception as e:  # jaringan putus, server menolak, checksum salah, dsb.
-                    self.log(f"  Gagal: {e}")
-                    ok = False
-                (done_names if ok else failed).append(label)
-        except Exception as e:
-            self.log(f"Unduhan berhenti: {e}")
-            failed.extend(COMPONENT_LABELS[n] for n in todo
-                          if COMPONENT_LABELS[n] not in done_names + failed)
+            self.log(f"=== {title} ===")
+            ok = bool(fn(dl_dir, dlog, progress))
+        except Exception as e:  # jaringan putus, server menolak, checksum salah, dsb.
+            error = str(e)
+            self.log(f"  Gagal: {e}")
         finally:
             shutil.rmtree(dl_dir, ignore_errors=True)
+            for s in restart:
+                self.log(f"Menyalakan lagi {s.name}…")
+                s.start()
             self._downloading = False
 
-        warn = ""
-        if vc_redist_missing():
-            warn = "Pasang Visual C++ Redistributable x64 agar komponen bisa berjalan."
-            self.log(f"PERHATIAN: Visual C++ Redistributable x64 belum terpasang; Apache, PHP, dan MariaDB "
-                     f"tidak akan jalan tanpanya. Unduh: {VC_REDIST}")
-        if failed:
-            title = f"Unduhan gagal: {', '.join(failed)}"
-            detail = (f"Berhasil: {', '.join(done_names)}.  " if done_names else "") + "Lihat log untuk detail."
+        if ok:
+            head, detail = f"{title} selesai", "Siap dipakai."
+            if vc_redist_missing():
+                detail = "Pasang Visual C++ Redistributable x64 (halaman Komponen) agar bisa berjalan."
         else:
-            title = f"Unduhan selesai: {', '.join(done_names)}"
-            detail = warn or "Komponen siap dipakai. Nyalakan di halaman Layanan."
-        self.log(title)
-        self.ui(lambda: self._dl_done(not failed, title, detail))
+            head, detail = f"{title} gagal", (error[:160] + "  ·  " if error else "") + "Lihat log untuk detail."
+        self.log(head)
+        self.ui(lambda: self._dl_done(ok, head, detail))
         if self.tray:
-            self.tray.notify(title, detail)
+            self.tray.notify(head, detail)
         self.ui(self.refresh_php_versions)
         self.ui(self.refresh_sites)
+        self.ui(lambda: self.current_page == "components" and self.refresh_components())
 
     # --- panel progres unduhan (selalu terlihat di bawah halaman mana pun) ---
     def _build_download_banner(self):

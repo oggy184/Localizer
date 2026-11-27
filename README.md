@@ -19,12 +19,17 @@ Localizer/
    └─ nodejs/           (opsional, untuk Terminal)
 ```
 
-### Unduh otomatis (Apache, PHP, MariaDB, phpMyAdmin)
+### Pasang & perbarui otomatis (Apache, PHP, MariaDB, phpMyAdmin)
 
-Buka **Pengaturan → Unduh Komponen…** (atau **PHP → Unduh versi PHP…**), centang komponen yang
-diinginkan, lalu klik **Unduh**.
-Progresnya tampil di log. Versi PHP (bisa lebih dari satu, mis. `8.3 8.4`) dan versi MariaDB
-(mis. `11.4`) boleh dikosongkan untuk memakai versi terbaru.
+Buka halaman **Komponen** di sidebar. Versi terbaru diperiksa otomatis saat halaman dibuka
+(atau klik **Periksa pembaruan**), lalu setiap komponen menampilkan **Pasang**, **Perbarui**, atau **Terbaru**.
+Progres tampil di panel bawah jendela, dan notifikasi Windows muncul saat selesai.
+
+- **PHP**: pilih cabang (mis. `8.4`) lalu **Pasang**; bisa lebih dari satu versi. Pembaruan memasang
+  versi baru di folder baru dan memindahkan versi aktif bila versi lama sedang aktif.
+- **MariaDB**: pilih cabang saat memasang (bawaan: LTS terbaru). Pembaruan hanya di cabang yang sama.
+- **Apache**: saat diperbarui, folder `conf` lama dicadangkan ke `bin/apache-conf-cadangan`.
+- Layanan yang file-nya diganti dihentikan sementara lalu dinyalakan lagi otomatis.
 
 | Komponen   | Lokasi                    | Catatan                                                     |
 | ---------- | ------------------------- | ----------------------------------------------------------- |
@@ -86,16 +91,17 @@ hapus opsi itu bila tidak diperlukan.
 
 ## Tampilan
 
-Sidebar dengan enam halaman:
+Sidebar dengan tujuh halaman:
 
 | Halaman    | Isi                                                                              |
 | ---------- | -------------------------------------------------------------------------------- |
 | Dashboard  | Status web server, database, PHP aktif, jumlah situs; akses cepat; aktivitas terbaru |
 | Situs      | Daftar situs (nama, URL, jenis Laravel/WordPress/PHP); buka di browser, folder, terminal, VS Code |
 | Layanan    | Sakelar on/off per layanan dengan status dan port                                |
-| PHP        | Versi terpasang, aktifkan versi lain, edit php.ini, unduh versi baru             |
+| PHP        | Versi terpasang, aktifkan versi lain, edit php.ini                               |
+| Komponen   | Pasang & perbarui Apache, PHP, MariaDB, phpMyAdmin; status Visual C++            |
 | Log        | Keluaran semua layanan                                                           |
-| Pengaturan | Jalan otomatis, akhiran domain (TLD), folder, unduh komponen                     |
+| Pengaturan | Jalan otomatis, akhiran domain (TLD), folder                                     |
 
 Teks tetap tajam di layar berskala 125%/150%.
 
