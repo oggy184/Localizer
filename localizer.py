@@ -85,9 +85,16 @@ def load_config():
     return cfg
 
 
+_CONFIG_LOCK = threading.Lock()
+
+
 def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    # tulis ke file sementara lalu ganti: crash/penyimpanan bersamaan tidak merusak config.json
+    with _CONFIG_LOCK:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        os.replace(tmp, CONFIG_PATH)
 
 
 CFG = load_config()
@@ -322,6 +329,16 @@ def download_file(url, dest, log, sha=None, progress=None):
     if sha and h.hexdigest().lower() != sha.lower():
         os.remove(dest)
         raise RuntimeError(f"checksum SHA-256 tidak cocok untuk {os.path.basename(dest)}")
+    # cek zip utuh SEBELUM pemasang menghapus versi lama (Apache tidak punya checksum)
+    if dest.lower().endswith(".zip"):
+        try:
+            with zipfile.ZipFile(dest) as z:
+                bad = z.testzip()
+        except zipfile.BadZipFile:
+            bad = "arsip tidak terbaca"
+        if bad:
+            os.remove(dest)
+            raise RuntimeError(f"unduhan {os.path.basename(dest)} rusak/terpotong ({bad}); coba lagi")
 
 
 def zip_top_folder(zip_path):
